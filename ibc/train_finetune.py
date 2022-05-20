@@ -20,6 +20,8 @@ import datetime
 import functools
 import os
 import reverb
+import rlds
+import tensorflow_datasets as tfds
 
 from absl import app
 from absl import flags
@@ -29,6 +31,7 @@ from ibc.environments.block_pushing import block_pushing  # pylint: disable=unus
 from ibc.environments.block_pushing import block_pushing_discontinuous  # pylint: disable=unused-import
 from ibc.environments.particle import particle  # pylint: disable=unused-import
 from ibc.ibc import tasks
+from ibc.ibc.utils import strategy_policy
 from ibc.ibc.agents import ibc_policy  # pylint: disable=unused-import
 from ibc.ibc.agents.ft_agent import IBCFinetuneAgent
 from ibc.ibc.eval import eval_env as eval_env_module
@@ -37,15 +40,19 @@ from ibc.ibc.train import get_cloning_network as cloning_network_module
 from ibc.ibc.train import get_data as data_module
 from ibc.ibc.train import get_eval_actor as eval_actor_module
 from ibc.ibc.train import get_learner as learner_module
+from ibc.ibc.train import get_learner_rb as learner_module_rb
 from ibc.ibc.train import get_normalizers as normalizers_module
+from ibc.ibc.train import get_normalizers_rb as normalizers_module_rb
 from ibc.ibc.train import get_sampling_spec as sampling_spec_module
 from ibc.ibc.utils import make_video as video_module
 import tensorflow as tf
+from tf_agents.examples.cql_sac.kumar20.data_utils import create_tf_record_dataset
 from tf_agents.system import system_multiprocessing as multiprocessing
 from tf_agents.train import actor
 from tf_agents.train import learner
 from tf_agents.train import triggers
 from tf_agents.metrics import py_metrics
+from tf_agents.specs import tensor_spec
 from tf_agents.train.utils import spec_utils
 from tf_agents.train.utils import strategy_utils
 from tf_agents.train.utils import train_utils
@@ -64,9 +71,11 @@ flags.DEFINE_bool('shared_memory_eval', False,
 flags.DEFINE_bool('video', False,
                   'If true, write out one rollout video after eval.')
 flags.DEFINE_multi_enum(
-    'task', None,
+    'task', 'pen-human-v0',
     (tasks.IBC_TASKS + tasks.D4RL_TASKS),
     'If True the reach task is evaluated.')
+flags.DEFINE_string('offline_dataset_name', 'd4rl_adroit_pen',
+                    'D4RL dataset name.')
 flags.DEFINE_boolean('viz_img', default=False,
                      help='Whether to save out imgs of what happened.')
 flags.DEFINE_bool('skip_eval', False,
@@ -83,12 +92,15 @@ flags.DEFINE_integer(
 
 FLAGS = flags.FLAGS
 VIZIER_KEY = 'success'
+_SEQUENCE_LENGTH = 2
+_STRIDE_LENGTH = 1
 
 
 @gin.configurable
 def train_eval(
     task=None,
     dataset_path=None,
+    dataset_name=None,
     root_dir=None,
     # 'ebm' or 'mse' or 'mdn'.
     loss_type=None,
@@ -101,10 +113,12 @@ def train_eval(
     learning_rate=1e-3,
     decay_steps=100,
     replay_capacity=100000,
+    initial_collect_steps=10000,
     eval_interval=1000,
     eval_loss_interval=100,
     eval_episodes=1,
     fused_train_steps=100,
+    data_shuffle_buffer_size=100,
     sequence_length=2,
     uniform_boundary_buffer=0.05,
     critic_learning_rate=3e-4,
@@ -119,11 +133,13 @@ def train_eval(
     skip_eval=False,
     num_envs=1,
     reverb_port=None,
+    offline_reverb_port=None,
     shared_memory_eval=False,
     image_obs=False,
     strategy=None,
     policy_save_interval=10000,
     replay_buffer_save_interval=100000,
+    load_dataset_fn=tfds.load,
     # Use this to sweep amount of tfrecords going into training.
     # -1 for 'use all'.
     max_data_shards=-1,
@@ -160,37 +176,127 @@ def train_eval(
   obs_tensor_spec, action_tensor_spec, time_step_tensor_spec = (
       spec_utils.get_tensor_specs(eval_envs[0]))
 
-  # Compute normalization info from training data.
-  # TODO(karl): add reward & done info --> or use separate reverb data loader?
-  create_train_and_eval_fns_unnormalized = data_module.get_data_fns(
-      dataset_path,
-      sequence_length,
-      replay_capacity,
-      batch_size,
-      for_rnn,
-      dataset_eval_fraction,
-      flatten_action)
-  train_data, _ = create_train_and_eval_fns_unnormalized()
-  (norm_info, norm_train_data_fn) = normalizers_module.get_normalizers(
-      train_data, batch_size, env_name)
+  # Create training and validation offline dataset.
+  if not dataset_path.endswith('.tfrecord'):
+      dataset_path = os.path.join(dataset_path, env_name,
+                                  '%s*.tfrecord' % env_name)
+  logging.info('Loading dataset from %s', dataset_path)
+  dataset_paths = tf.io.gfile.glob(dataset_path)
+  num_eval_shards = int(len(dataset_paths) * dataset_eval_fraction)
+  num_train_shards = len(dataset_paths) - num_eval_shards
+  train_shards = dataset_paths[:num_train_shards]
+  if num_eval_shards > 0:
+      eval_shards = dataset_paths[num_train_shards:]
 
-  # Create normalized training data.
   if not strategy:
     strategy = tf.distribute.get_strategy()
-  per_replica_batch_size = batch_size // strategy.num_replicas_in_sync
-  create_train_and_eval_fns = data_module.get_data_fns(
-      dataset_path,
-      sequence_length,
-      replay_capacity,
-      per_replica_batch_size,
-      for_rnn,
-      dataset_eval_fraction,
-      flatten_action,
-      norm_function=norm_train_data_fn,
-      max_data_shards=max_data_shards)
-  # Create properly distributed eval data iterator.
-  dist_eval_data_iter = get_distributed_eval_data(create_train_and_eval_fns,
-                                                  strategy)
+
+  with strategy.scope():
+      train_data = create_tf_record_dataset(
+          train_shards,
+          batch_size,
+          shuffle_buffer_size_per_record=1,
+          shuffle_buffer_size=data_shuffle_buffer_size,
+          num_shards=1,
+          cycle_length=10,
+          block_length=10,
+          num_parallel_reads=None,
+          num_parallel_calls=10,
+          num_prefetch=10,
+          strategy=strategy,
+          reward_shift=0.0,
+          action_clipping=None,
+          use_trajectories=True)
+
+      if num_eval_shards > 0:
+          val_data = create_tf_record_dataset(
+              dataset_paths,
+              batch_size,
+              shuffle_buffer_size_per_record=1,
+              shuffle_buffer_size=data_shuffle_buffer_size,
+              num_shards=1,
+              cycle_length=10,
+              block_length=10,
+              num_parallel_reads=None,
+              num_parallel_calls=10,
+              num_prefetch=10,
+              strategy=strategy,
+              reward_shift=0.0,
+              action_clipping=None,
+              use_trajectories=True)
+          dist_eval_data_iter = iter(       # properly distributed data loader
+                  strategy.distribute_datasets_from_function(lambda: val_data))
+      else:
+          val_data = None
+          dist_eval_data_iter = None
+
+  (norm_info, _) = normalizers_module_rb.get_normalizers_rb(
+      train_data, batch_size, env_name)
+
+  # # Create dataset of TF-Agents trajectories from RLDS D4RL dataset.
+  # #
+  # # The RLDS dataset will be converted to trajectories and pushed to Reverb.
+  # rlds_data = load_dataset_fn(dataset_name)['train']
+  # trajectory_data_spec = rlds_to_reverb.create_trajectory_data_spec(rlds_data)
+  # offline_table_name = 'offline_uniform_table'
+  # offline_table = reverb.Table(
+  #     name=offline_table_name,
+  #     max_size=data_shuffle_buffer_size,
+  #     sampler=reverb.selectors.Uniform(),
+  #     remover=reverb.selectors.Fifo(),
+  #     rate_limiter=reverb.rate_limiters.MinSize(1),
+  #     signature=tensor_spec.add_outer_dim(trajectory_data_spec))
+  # offline_reverb_server = reverb.Server([offline_table], port=offline_reverb_port)
+  # offline_reverb_replay = reverb_replay_buffer.ReverbReplayBuffer(
+  #     trajectory_data_spec,
+  #     sequence_length=_SEQUENCE_LENGTH,
+  #     table_name=offline_table_name,
+  #     local_server=offline_reverb_server)
+  # offline_rb_observer = reverb_utils.ReverbAddTrajectoryObserver(
+  #     offline_reverb_replay.py_client,
+  #     offline_table_name,
+  #     sequence_length=_SEQUENCE_LENGTH,
+  #     stride_length=_STRIDE_LENGTH,
+  #     pad_end_of_episodes=False)
+  #
+  # rlds_to_reverb.push_rlds_to_reverb(rlds_data, offline_rb_observer)
+  #
+  # def _experience_dataset() -> tf.data.Dataset:
+  #     """Reads and returns the experiences dataset from Reverb Replay Buffer."""
+  #     return offline_reverb_replay.as_dataset(
+  #         sample_batch_size=batch_size,
+  #         num_steps=_SEQUENCE_LENGTH).prefetch(50)
+
+  # create_train_and_eval_fns_unnormalized = data_module.get_data_fns(
+  #     dataset_path,
+  #     sequence_length,
+  #     replay_capacity,
+  #     batch_size,
+  #     for_rnn,
+  #     dataset_eval_fraction,
+  #     flatten_action)
+  # train_data, _ = create_train_and_eval_fns_unnormalized()
+  # (norm_info, _) = normalizers_module_rb.get_normalizers_rb(
+  #     train_data, batch_size, env_name)
+  #
+  # # Create normalized training data.
+  # if not strategy:
+  #   strategy = tf.distribute.get_strategy()
+  # per_replica_batch_size = batch_size // strategy.num_replicas_in_sync
+  # create_train_and_eval_fns = data_module.get_data_fns(
+  #     dataset_path,
+  #     sequence_length,
+  #     replay_capacity,
+  #     per_replica_batch_size,
+  #     for_rnn,
+  #     dataset_eval_fraction,
+  #     flatten_action,
+  #     norm_function=norm_train_data_fn,
+  #     max_data_shards=max_data_shards)
+
+  # # Create properly distributed eval data iterator.
+  # dist_eval_data_iter = get_distributed_eval_data(create_train_and_eval_fns,
+  #                                                 strategy)
 
   # Create normalization layers for obs and action.
   with strategy.scope():
@@ -233,28 +339,29 @@ def train_eval(
                                    train_step,
                                    decay_steps)
 
-    # Define bc learner.
-    bc_learner = learner_module.get_learner(
+    # Define offline learner.
+    offline_learner = learner_module_rb.get_learner(
         loss_type,
         root_dir,
         agent,
         train_step,
-        create_train_and_eval_fns,
+        lambda: train_data,
         fused_train_steps,
         strategy)
 
-    # TODO(karl): create online RL agent (w/ online RL _train() function)
-    rl_agent = agent = IBCFinetuneAgent(time_step_spec=time_step_tensor_spec,
-                                        action_spec=action_tensor_spec,
-                                        action_sampling_spec=action_sampling_spec,
-                                        obs_norm_layer=norm_info.obs_norm_layer,
-                                        act_norm_layer=norm_info.act_norm_layer,
-                                        act_denorm_layer=norm_info.act_denorm_layer,
-                                        cloning_network=cloning_network,
-                                        optimizer=tf.keras.optimizers.Adam(learning_rate=critic_learning_rate),
-                                        train_step_counter=train_step)
+    # # TODO(karl): create online RL agent (w/ online RL _train() function)
+    # rl_agent = agent = IBCFinetuneAgent(time_step_spec=time_step_tensor_spec,
+    #                                     action_spec=action_tensor_spec,
+    #                                     action_sampling_spec=action_sampling_spec,
+    #                                     obs_norm_layer=norm_info.obs_norm_layer,
+    #                                     act_norm_layer=norm_info.act_norm_layer,
+    #                                     act_denorm_layer=norm_info.act_denorm_layer,
+    #                                     cloning_network=cloning_network,
+    #                                     optimizer=tf.keras.optimizers.Adam(learning_rate=critic_learning_rate),
+    #                                     train_step_counter=train_step)
+    #
 
-    # TODO(karl): create reverb replay buffer
+    # create reverb online replay buffer
     table_name = 'uniform_table'
     table = reverb.Table(
         table_name,
@@ -284,17 +391,26 @@ def train_eval(
         return reverb_replay.as_dataset(
             sample_batch_size=batch_size, num_steps=2).prefetch(50)
 
-    # TODO(karl): create online RL actor w/ online_rl_agent.collect_policy
+    # create online RL actors
+    greedy_policy = strategy_policy.StrategyPyTFEagerPolicy(
+        agent.policy, strategy=strategy)
+    initial_collect_actor = actor.Actor(
+        eval_envs[0],
+        greedy_policy,
+        train_step,
+        steps_per_run=initial_collect_steps,
+        observers=[rb_observer])
+
     collect_actor = actor.Actor(
         eval_envs[0],
-        rl_agent.policy,
+        greedy_policy,
         train_step,
         steps_per_run=1,
         metrics=actor.collect_metrics(10),
         summary_dir=os.path.join(root_dir, "rl"),
         observers=[rb_observer, py_metrics.EnvironmentSteps()])
 
-    # TODO(karl): create online RL learner
+    # create online RL learner
     saved_model_dir = os.path.join(root_dir, learner.POLICY_SAVED_MODEL_DIR)
     learning_triggers = [
         triggers.PolicySavedModelTrigger(
@@ -311,10 +427,10 @@ def train_eval(
         triggers.StepPerSecondLogTrigger(train_step, interval=1000),
     ]
 
-    agent_learner = learner.Learner(
+    online_learner = learner.Learner(
         root_dir,
         train_step,
-        rl_agent,
+        agent,
         experience_dataset_fn,
         triggers=learning_triggers,
         strategy=strategy)
@@ -351,8 +467,8 @@ def train_eval(
   # Main train and eval loop.
   while train_step.numpy() < (num_iterations + num_rl_iterations):
     if train_step.numpy() < num_iterations:
-      # Run bc_learner for fused_train_steps.
-      training_step(agent, bc_learner, fused_train_steps, train_step)
+      # Run offline_learner for fused_train_steps.
+      training_step(agent, offline_learner, fused_train_steps, train_step)
 
       if (dist_eval_data_iter is not None and
               train_step.numpy() % eval_loss_interval == 0):
@@ -361,9 +477,14 @@ def train_eval(
               dist_eval_data_iter, bc_learner, train_step, get_eval_loss)
 
     else:
+      if train_step.numpy() == num_iterations:
+          # before starting online RL, collect initial samples for replay buffer
+          logging.info(f"Collecting {initial_collect_steps} samples to initialize online replay buffer.")
+          initial_collect_actor.run()
+          logging.info("Done!")
       # Run online RL for 1 step
       collect_actor.run()
-      agent_learner.run(iterations=1)
+      online_learner.run(iterations=1)
 
     if not skip_eval and train_step.numpy() % eval_interval == 0:
 
@@ -496,6 +617,7 @@ def main(_):
       skip_eval=FLAGS.skip_eval,
       shared_memory_eval=FLAGS.shared_memory_eval,
       reverb_port=FLAGS.reverb_port,
+      dataset_name=FLAGS.offline_dataset_name,
       strategy=strategy)
 
 

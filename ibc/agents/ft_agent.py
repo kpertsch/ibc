@@ -27,6 +27,7 @@ from ibc.ibc.losses import ebm_loss
 from ibc.ibc.losses import gradient_loss
 import tensorflow as tf
 from tf_agents.agents import tf_agent
+from tf_agents.agents import data_converter
 from tf_agents.networks import network
 from tf_agents.policies import greedy_policy
 from tf_agents.specs import tensor_spec
@@ -129,6 +130,8 @@ class IBCFinetuneAgent(base_agent.BehavioralCloningAgent):
         summarize_grads_and_vars=summarize_grads_and_vars,
         train_step_counter=train_step_counter)
 
+    self._as_transition = data_converter.AsTransition(self.data_context, squeeze_time_dim=1)
+
   def _train(self, experience, weights):
     """Returns a train op to update the agent's networks.
 
@@ -156,13 +159,13 @@ class IBCFinetuneAgent(base_agent.BehavioralCloningAgent):
       assert trainable_critic_variables, ('No trainable critic variables to '
                                           'optimize.')
       tape.watch(trainable_critic_variables)
-      critic_loss = self._critic_loss_weight*self.critic_loss(
+      critic_loss = self.critic_loss(
           time_steps,
           actions,
           next_time_steps,
-          td_errors_loss_fn=self._td_errors_loss_fn,
-          gamma=self._gamma,
-          reward_scale_factor=self._reward_scale_factor,
+          td_errors_loss_fn=tf.math.squared_difference,
+          gamma=1.0,
+          reward_scale_factor=1.0,
           weights=weights,
           training=True)
 
@@ -242,8 +245,8 @@ class IBCFinetuneAgent(base_agent.BehavioralCloningAgent):
         actions,
         next_time_steps,
         td_errors_loss_fn=tf.math.squared_difference,
-        gamma=self._gamma,
-        reward_scale_factor=self._reward_scale_factor,
+        gamma=1.0,
+        reward_scale_factor=1.0,
         weights=weights,
         training=training)
     tf.debugging.check_numerics(critic_loss, 'Critic loss is inf or nan.')

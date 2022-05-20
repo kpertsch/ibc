@@ -27,6 +27,7 @@ from ibc.ibc.losses import ebm_loss
 from ibc.ibc.losses import gradient_loss
 import tensorflow as tf
 from tf_agents.agents import tf_agent
+from tf_agents.agents import data_converter
 from tf_agents.networks import network
 from tf_agents.policies import greedy_policy
 from tf_agents.specs import tensor_spec
@@ -129,6 +130,8 @@ class ImplicitBCAgent(base_agent.BehavioralCloningAgent):
         summarize_grads_and_vars=summarize_grads_and_vars,
         train_step_counter=train_step_counter)
 
+    self._as_transition = data_converter.AsTransition(self.data_context, squeeze_time_dim=1)
+
   def _loss(self,
             experience,
             variables_to_train=None,
@@ -138,7 +141,12 @@ class ImplicitBCAgent(base_agent.BehavioralCloningAgent):
     # to deal with it.
     # Observation: [B x T x obs_spec]
     # Action:      [B x act_spec]
-    observations, actions = experience
+    transition = self._as_transition(experience)
+    time_steps, policy_steps, next_time_steps = transition
+    observations, actions = time_steps.observation, policy_steps.action
+
+    # apply normalization
+    observations, actions = self._obs_norm_layer(observations), self._act_norm_layer(actions)
 
     # Use first observation to figure out batch/time sizes as they should be the
     # same across all observations.

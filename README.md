@@ -31,10 +31,11 @@ pip install \
   opencv-python==4.5.3.56 \
   pybullet==3.1.6 \
   scipy==1.7.1 \
-  tensorflow==2.6.0 \
-  keras==2.6.0 \
-  tf-agents==0.11.0rc0 \
-  tqdm==4.62.2
+  tensorflow==2.8.1 \
+  keras==2.8.0 \
+  tf-agents==0.12.0 \
+  tqdm==4.62.2 \
+  dm-reverb==0.7.3
 ```
 
 (Optional): For Mujoco support, see [`docs/mujoco_setup.md`](docs/mujoco_setup.md).  Recommended to skip it
